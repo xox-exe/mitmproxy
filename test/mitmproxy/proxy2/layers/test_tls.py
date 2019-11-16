@@ -1,4 +1,3 @@
-import os
 import ssl
 import typing
 
@@ -69,16 +68,18 @@ def test_get_client_hello():
 class SSLTest:
     """Helper container for Python's builtin SSL object."""
 
-    def __init__(self, server_side: bool = False, alpn: typing.List[bytes] = None,
+    def __init__(self, server_side: bool = False, alpn: typing.Optional[typing.List[str]] = None,
                  sni: typing.Optional[bytes] = b"example.com"):
         self.inc = ssl.MemoryBIO()
         self.out = ssl.MemoryBIO()
         self.ctx = ssl.SSLContext()
-        if alpn:
+        if alpn is not None:
             self.ctx.set_alpn_protocols(alpn)
         if server_side:
-            # FIXME: Replace hardcoded location
-            self.ctx.load_cert_chain(os.path.expanduser("~/.mitmproxy/mitmproxy-ca.pem"))
+            self.ctx.load_cert_chain(
+                certfile=tlsdata.path("../../net/data/verificationcerts/trusted-root.crt"),
+                keyfile=tlsdata.path("../../net/data/verificationcerts/trusted-root.key"),
+            )
         self.obj = self.ctx.wrap_bio(
             self.inc,
             self.out,
@@ -127,7 +128,7 @@ def reply_tls_start(*args, **kwargs) -> tutils.reply:
 
     def make_conn(hook: commands.Hook) -> None:
         tls_start = hook.data
-        assert isinstance(tls_start, tls.TlsStart)
+        assert isinstance(tls_start, tls.StartHookData)
         ssl_context = SSL.Context(SSL.SSLv23_METHOD)
         if tls_start.conn == tls_start.context.client:
             ssl_context.use_privatekey_file(
@@ -209,12 +210,13 @@ def _make_client_tls_layer(tctx: context.Context) -> typing.Tuple[tutils.Playboo
 
 def _test_tls_client_server(
         tctx: context.Context,
-        sni: typing.Optional[bytes]
+        sni: typing.Optional[bytes] = b"example.com",
+        alpn: typing.Optional[typing.List[str]] = None
 ) -> typing.Tuple[tutils.Playbook, tls.ClientTLSLayer, SSLTest]:
     playbook, client_layer = _make_client_tls_layer(tctx)
     tctx.server.tls = True
     tctx.server.address = ("example.com", 443)
-    tssl_client = SSLTest(sni=sni)
+    tssl_client = SSLTest(sni=sni, alpn=alpn)
 
     # Send ClientHello
     with pytest.raises(ssl.SSLWantReadError):
@@ -237,6 +239,8 @@ class TestClientTLS:
         assert (
                 playbook
                 >> events.DataReceived(tctx.client, tssl.out.read())
+                << commands.Hook("tls_clienthello", tutils.Placeholder())
+                >> tutils.reply()
                 << commands.Hook("tls_start", tutils.Placeholder())
                 >> reply_tls_start()
                 << commands.SendData(tctx.client, data)
@@ -264,11 +268,13 @@ class TestClientTLS:
         we only establish a connection with the client. The server connection may ultimately
         be established when OpenConnection is called.
         """
-        playbook, client_layer, tssl = _test_tls_client_server(tctx, sni=b"example.com")
+        playbook, client_layer, tssl = _test_tls_client_server(tctx)
         data = tutils.Placeholder()
         assert (
                 playbook
                 >> events.DataReceived(tctx.client, tssl.out.read())
+                << commands.Hook("tls_clienthello", tutils.Placeholder())
+                >> tutils.reply()
                 << commands.Hook("tls_start", tutils.Placeholder())
                 >> reply_tls_start()
                 << commands.SendData(tctx.client, data)
@@ -280,17 +286,25 @@ class TestClientTLS:
 
     def test_server_required(self, tctx):
         """
-        Here we test the scenario where a server connection is required (because SNI is missing)
+        Here we test the scenario where a server connection is required (for example, because SNI is missing)
         to establish TLS with the client.
         """
         tssl_server = SSLTest(server_side=True)
-        playbook, client_layer, tssl_client = _test_tls_client_server(tctx, sni=None)
+        playbook, client_layer, tssl_client = _test_tls_client_server(tctx, sni=None, alpn=["quux"])
 
         # We should now get instructed to open a server connection.
         data = tutils.Placeholder()
+        tls_clienthello = tutils.Placeholder()
+
+        def require_server_conn(hook: commands.Hook) -> None:
+            assert isinstance(hook.data, tls.ClientHelloHookData)
+            hook.data.establish_server_tls_first = True
+
         assert (
                 playbook
                 >> events.DataReceived(tctx.client, tssl_client.out.read())
+                << commands.Hook("tls_clienthello", tls_clienthello)
+                >> tutils.reply(side_effect=require_server_conn)
                 << commands.OpenConnection(tctx.server)
                 >> tutils.reply(None)
                 << commands.Hook("tls_start", tutils.Placeholder())
@@ -327,5 +341,8 @@ class TestClientTLS:
         # Both handshakes completed!
         assert tctx.client.tls_established
         assert tctx.server.tls_established
+        assert tctx.server.sni == tctx.client.sni
+        assert tctx.client.alpn == b"quux"
+        assert tctx.server.alpn == b"quux"
         _test_echo(playbook, tssl_server, tctx.server)
         _test_echo(playbook, tssl_client, tctx.client)
